@@ -576,25 +576,121 @@ function fmtTime(iso) {
   return iso ? new Date(iso).toLocaleString('en-US', { timeZone: 'Asia/Jakarta' }) : '—';
 }
 
-function renderRpowSummary() {
-  const currentNode = state.rpow.target === 'both' ? state.rpow.nodeInfo?.[state.rpow.activeTarget] : state.rpow.nodeInfo?.[state.rpow.activeTarget || state.rpow.target];
-  const targetLabel = state.rpow.target === 'both' ? `both (${state.rpow.activeTarget || 'waiting'})` : state.rpow.target;
-  const nodeLabel = currentNode ? `${currentNode.token_name || currentNode.name || state.rpow.activeTarget || state.rpow.target} | difficulty ${currentNode.difficulty_bits ?? '—'} | users ${currentNode.user_count ?? '—'}` : 'no node info yet';
-  return `RPOW: ${state.rpow.running ? 'running' : 'stopped'} | target=${targetLabel} | mints=${state.rpow.totalMints} | speed=${state.rpow.hashesPerSecond.toLocaleString()} h/s | ${nodeLabel}`;
+
+function strOrDash(value) {
+  return value === null || value === undefined || value === '' ? '—' : String(value);
 }
 
-function renderRpow2Summary() {
-  const me = state.rpow2.me;
-  const ledger = state.rpow2.ledger;
-  const reward = ledger?.current_reward_base_units || '—';
-  const diff = ledger?.current_difficulty_bits ?? '—';
-  const balance = me?.balance_base_units || me?.balance || '—';
-  return `RPOW2: ${state.rpow2.running ? 'running' : 'stopped'} | mints=${state.rpow2.totalMints} | balance=${balance} | reward=${reward} | difficulty=${diff}`;
+function buildRpowMinerTab(nodeId) {
+  const label = nodeId === 'alpha' ? 'RPOW A' : 'RPOW B';
+  const nodeInfo = state.rpow.nodeInfo[nodeId] || null;
+  const target = state.rpow.target;
+  const active = target === 'both' ? state.rpow.activeTarget === nodeId : target === nodeId;
+  const status = !state.rpow.running ? 'stopped' : active ? 'active' : target === 'both' ? 'waiting' : 'idle';
+  const statusLine = nodeInfo
+    ? `${label} ${status} · difficulty ${strOrDash(nodeInfo.difficulty_bits)} · supply ${strOrDash(nodeInfo.current_supply)}/${strOrDash(nodeInfo.max_supply)}`
+    : `${label} ${status} · waiting for node data`;
+  const metrics = {
+    status,
+    target,
+    'active target': state.rpow.activeTarget || '—',
+    'wallet configured': state.rpow.walletConfigured ? 'yes' : 'no',
+    'wallet pubkey': state.rpow.wallet.pubHex || '—',
+    mints: String(state.rpow.totalMints),
+    hashes: String(state.rpow.hashes),
+    speed: state.rpow.hashesPerSecond ? state.rpow.hashesPerSecond.toLocaleString() + ' h/s' : '—',
+    'last mint': state.rpow.lastMintAt ? fmtTime(state.rpow.lastMintAt) : '—',
+    difficulty: strOrDash(nodeInfo?.difficulty_bits),
+    supply: nodeInfo ? strOrDash(nodeInfo.current_supply) + '/' + strOrDash(nodeInfo.max_supply) : '—',
+    'tokens to halving': strOrDash(nodeInfo?.tokens_to_halving),
+    'node pubkey': strOrDash(nodeInfo?.signing_pubkey_hex),
+  };
+  const activity = [
+    'status: ' + status,
+    state.rpow.lastChallenge?.nodeId === nodeId ? 'challenge: ' + state.rpow.lastChallenge.challenge_id : '',
+    state.rpow.lastResult?.nodeId === nodeId ? 'last result: ' + JSON.stringify(state.rpow.lastResult) : '',
+    state.rpow.lastError ? 'last error: ' + state.rpow.lastError : '',
+  ].filter(Boolean);
+  return {
+    id: nodeId,
+    title: label,
+    status,
+    statusLine,
+    metrics,
+    activity,
+    running: state.rpow.running,
+    active,
+    nodeInfo,
+    totalMints: state.rpow.totalMints,
+    hashes: state.rpow.hashes,
+    hashesPerSecond: state.rpow.hashesPerSecond,
+    lastMintAt: state.rpow.lastMintAt,
+    lastError: state.rpow.lastError,
+    lastChallenge: state.rpow.lastChallenge?.nodeId === nodeId ? state.rpow.lastChallenge : null,
+    lastResult: state.rpow.lastResult?.nodeId === nodeId ? state.rpow.lastResult : null,
+  };
+}
+
+function buildRpow2Tab() {
+  const me = state.rpow2.me || null;
+  const ledger = state.rpow2.ledger || null;
+  const status = !state.rpow2.running ? 'stopped' : state.rpow2.lastError ? 'error' : 'active';
+  const statusLine = state.rpow2.lastError ? 'error: ' + state.rpow2.lastError : state.rpow2.running ? 'running' : 'stopped';
+  const metrics = {
+    status,
+    'cookie configured': state.rpow2.cookieConfigured ? 'yes' : 'no',
+    running: state.rpow2.running ? 'yes' : 'no',
+    mints: String(state.rpow2.totalMints),
+    hashes: String(state.rpow2.hashes),
+    speed: state.rpow2.hashesPerSecond ? state.rpow2.hashesPerSecond.toLocaleString() + ' h/s' : '—',
+    balance: me ? strOrDash(me.balance_base_units || me.balance) : '—',
+    reward: ledger ? strOrDash(ledger.current_reward_base_units) : '—',
+    difficulty: ledger ? strOrDash(ledger.current_difficulty_bits) : '—',
+    'last mint': state.rpow2.lastMintAt ? fmtTime(state.rpow2.lastMintAt) : '—',
+    'last challenge': state.rpow2.lastChallenge?.challenge_id || '—',
+  };
+  const activity = [
+    'status: ' + status,
+    state.rpow2.lastError ? 'last error: ' + state.rpow2.lastError : '',
+    state.rpow2.lastResult ? 'last result: ' + JSON.stringify(state.rpow2.lastResult) : '',
+  ].filter(Boolean);
+  return {
+    id: 'rpow2',
+    title: 'RPOW2',
+    status,
+    statusLine,
+    metrics,
+    activity,
+    running: state.rpow2.running,
+    active: state.rpow2.running,
+    me,
+    ledger,
+    totalMints: state.rpow2.totalMints,
+    hashes: state.rpow2.hashes,
+    hashesPerSecond: state.rpow2.hashesPerSecond,
+    lastMintAt: state.rpow2.lastMintAt,
+    lastError: state.rpow2.lastError,
+    lastChallenge: state.rpow2.lastChallenge,
+    lastResult: state.rpow2.lastResult,
+  };
+}
+
+function buildTabsData() {
+  return {
+    rpow2: buildRpow2Tab(),
+    rpowA: buildRpowMinerTab('alpha'),
+    rpowB: buildRpowMinerTab('beta'),
+  };
+}
+
+function telegramLine(tab) {
+  if (tab.id === 'rpow2') {
+    return tab.title + ': ' + tab.status + ' | mints=' + tab.metrics.mints + ' | balance=' + tab.metrics.balance + ' | reward=' + tab.metrics.reward + ' | diff=' + tab.metrics.difficulty;
+  }
+  return tab.title + ': ' + tab.status + ' | mints=' + tab.metrics.mints + ' | hashes=' + tab.metrics.hashes + ' | speed=' + tab.metrics.speed + ' | diff=' + tab.metrics.difficulty + ' | supply=' + tab.metrics.supply + ' | to-halving=' + tab.metrics['tokens to halving'];
 }
 
 function dashboardHtml() {
-  const botHint = state.telegram.botUsername ? `https://t.me/${state.telegram.botUsername}` : 'waiting for bot username';
-  const telegramHint = state.telegram.chatId ? 'linked' : (telegramToken ? 'send /start to the bot once to link Telegram' : 'telegram token not configured');
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -602,7 +698,7 @@ function dashboardHtml() {
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>rpow monitor</title>
   <style>
-    :root{color-scheme:dark;--bg:#09090b;--card:#111827;--border:#243044;--text:#e5e7eb;--muted:#94a3b8;--accent:#34d399;--warn:#f59e0b;--err:#f87171}
+    :root{color-scheme:dark;--bg:#09090b;--card:#111827;--border:#243044;--text:#e5e7eb;--muted:#94a3b8;--accent:#34d399;--warn:#f59e0b;--err:#f87171;--tab:#0f172a}
     *{box-sizing:border-box} body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;background:radial-gradient(circle at top,#0f172a,#09090b 60%);color:var(--text)}
     .wrap{max-width:1100px;margin:0 auto;padding:20px} h1{margin:0 0 6px;font-size:28px} .sub{color:var(--muted);margin-bottom:16px;line-height:1.45}
     .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px} .card{grid-column:span 6;background:rgba(17,24,39,.92);border:1px solid var(--border);border-radius:16px;padding:16px;box-shadow:0 16px 50px rgba(0,0,0,.24)} .card.full{grid-column:1/-1}
@@ -610,92 +706,158 @@ function dashboardHtml() {
     .k{color:var(--muted)} .v{word-break:break-all} .pill{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);border-radius:999px;padding:6px 10px;font-size:12px;color:var(--muted);background:rgba(15,23,42,.7)}
     .ok{color:var(--accent)} .warn{color:var(--warn)} .bad{color:var(--err)} .small{font-size:12px;color:var(--muted)} .statusline{font-size:14px;line-height:1.6} pre{margin:0;white-space:pre-wrap;word-break:break-word}
     .list{display:grid;gap:8px} .item{display:flex;justify-content:space-between;gap:10px;padding:10px 12px;border:1px solid var(--border);border-radius:12px;background:rgba(15,23,42,.45)}
+    .tabs{display:flex;gap:8px;flex-wrap:wrap}.tab-btn{border:1px solid var(--border);background:var(--tab);color:var(--text);padding:10px 12px;border-radius:12px;cursor:pointer;font:inherit}.tab-btn.active{border-color:var(--accent);box-shadow:0 0 0 1px rgba(52,211,153,.18) inset}.tab-btn .sub{display:block;font-size:11px;margin-top:4px;color:var(--muted)}
     @media (max-width:900px){.card{grid-column:1/-1}.kv{grid-template-columns:1fr}}
   </style>
 </head>
 <body>
   <div class="wrap">
     <h1>rpow monitor</h1>
-    <div class="sub">Public status page for both miners. This page is read-only and safe to open on your phone while your laptop is off.</div>
+    <div class="sub">Public status page for RPOW2, RPOW A, and RPOW B. Open it on your phone while the laptop is off.</div>
     <div class="grid">
       <div class="card full">
         <div class="row">
           <div>
-            <div class="pill ${state.rpow.running || state.rpow2.running ? 'ok' : 'warn'}" id="statePill">${state.rpow.running || state.rpow2.running ? 'running' : 'idle'}</div>
-            <div class="statusline" id="statusLine" style="margin-top:10px">${overallError ? `<span class="bad">${overallError}</span>` : 'all good'}</div>
+            <div class="pill" id="statePill">loading…</div>
+            <div class="statusline" id="statusLine" style="margin-top:10px">connecting…</div>
           </div>
-          <div class="small">${telegramHint}<br/>${botHint}</div>
+          <div class="small" id="telegramMeta">loading…</div>
         </div>
       </div>
-      <div class="card"><div class="kv" id="rpowStats"></div></div>
-      <div class="card"><div class="kv" id="rpow2Stats"></div></div>
+
+      <div class="card full">
+        <div class="row" style="margin-bottom:10px">
+          <strong>Tabs</strong>
+          <span class="small">RPOW2 + RPOW A + RPOW B</span>
+        </div>
+        <div class="tabs" id="tabBar"></div>
+      </div>
+
+      <div class="card">
+        <div class="row" style="margin-bottom:10px">
+          <strong id="tabTitle">Tab</strong>
+          <span class="small" id="tabStatus">waiting…</span>
+        </div>
+        <div class="kv" id="tabMetrics"></div>
+      </div>
+
+      <div class="card">
+        <div class="row" style="margin-bottom:10px">
+          <strong>Activity</strong>
+          <span class="small">selected tab</span>
+        </div>
+        <pre id="tabActivity" class="small">waiting…</pre>
+      </div>
+
       <div class="card full">
         <div class="row" style="margin-bottom:10px"><strong>Known RPOW nodes</strong><span class="small">auto-refreshed</span></div>
         <div class="list" id="nodesList"></div>
       </div>
+
       <div class="card full">
         <div class="row" style="margin-bottom:10px"><strong>Recent activity</strong><span class="small">local state only</span></div>
         <pre id="activity" class="small">waiting…</pre>
       </div>
+
       <div class="card full">
         <div class="row" style="margin-bottom:10px"><strong>Telegram</strong><span class="small">reports every ${Math.round(telegramReportMs / 60000)} min</span></div>
-        <div class="small">${telegramHint}</div>
+        <div class="small" id="telegramStatus">loading…</div>
       </div>
     </div>
   </div>
   <script>
-    async function load() {
-      const response = await fetch('/api/status', { headers: { accept: 'application/json' } });
-      const data = await response.json();
+    let selectedTab = 'rpow2';
+    let lastData = null;
+
+    function fmt(v) {
+      return v === null || v === undefined || v === '' ? '—' : String(v);
+    }
+
+    function renderMetrics(tab) {
+      const metrics = tab.metrics || {};
+      return Object.entries(metrics).map(function(entry) {
+        const k = entry[0];
+        const v = entry[1];
+        return '<div class="k">' + k + '</div><div class="v">' + fmt(v) + '</div>';
+      }).join('');
+    }
+
+    function renderTabs(data) {
+      const tabs = data.tabs || {};
+      const order = ['rpow2', 'rpowA', 'rpowB'];
+      const bar = document.getElementById('tabBar');
+      bar.innerHTML = order.map(function(key) {
+        const tab = tabs[key];
+        const active = selectedTab === key ? ' active' : '';
+        const title = tab ? tab.title : key;
+        const status = tab ? tab.status : '—';
+        return '<button class="tab-btn' + active + '" data-tab="' + key + '">' + title + '<span class="sub">' + status + '</span></button>';
+      }).join('');
+      bar.querySelectorAll('button[data-tab]').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          selectedTab = btn.getAttribute('data-tab') || 'rpow2';
+          if (lastData) render(lastData);
+        });
+      });
+    }
+
+    function renderSelectedTab(data) {
+      const tab = (data.tabs && data.tabs[selectedTab]) || (data.tabs && data.tabs.rpow2) || null;
+      if (!tab) return;
+      document.getElementById('tabTitle').textContent = tab.title || selectedTab;
+      document.getElementById('tabStatus').textContent = tab.statusLine || tab.status || '—';
+      document.getElementById('tabMetrics').innerHTML = renderMetrics(tab);
+      document.getElementById('tabActivity').textContent = (tab.activity || []).join('\n') || 'waiting…';
+      document.getElementById('telegramMeta').textContent = data.telegram && data.telegram.botUsername ? 'linked to @' + data.telegram.botUsername : 'waiting for Telegram link';
+      document.getElementById('telegramStatus').textContent = data.telegram && data.telegram.chatId ? 'linked to chat ' + data.telegram.chatId : 'send /start to the bot once to link Telegram';
+    }
+
+    function render(data) {
+      lastData = data;
+      if (!data.tabs || !data.tabs[selectedTab]) selectedTab = 'rpow2';
+      const overallActive = data.tabs && (data.tabs.rpow2?.running || data.tabs.rpowA?.running || data.tabs.rpowB?.running);
+      const overallError = data.overallError;
       const statePill = document.getElementById('statePill');
       const statusLine = document.getElementById('statusLine');
-      const rpowStats = document.getElementById('rpowStats');
-      const rpow2Stats = document.getElementById('rpow2Stats');
+      statePill.textContent = overallActive ? 'running' : 'idle';
+      statePill.className = 'pill ' + (overallActive ? 'ok' : 'warn');
+      statusLine.innerHTML = overallError ? '<span class="bad">' + overallError + '</span>' : 'all good';
+
+      renderTabs(data);
+      renderSelectedTab(data);
+
+      const rpow = data.rpow || {};
+      const rpow2 = data.rpow2 || {};
       const nodesList = document.getElementById('nodesList');
-      const activity = document.getElementById('activity');
-      statePill.textContent = (data.rpow.running || data.rpow2.running ? 'running' : 'idle');
-      statePill.className = 'pill ' + (data.rpow.running || data.rpow2.running ? 'ok' : 'warn');
-      statusLine.innerHTML = data.overallError ? '<span class="bad">' + data.overallError + '</span>' : 'all good';
-      const rpow = data.rpow;
-      const currentNode = rpow.target === 'both' ? (rpow.nodeInfo && rpow.nodeInfo[rpow.activeTarget]) : (rpow.nodeInfo && rpow.nodeInfo[rpow.activeTarget || rpow.target]);
-      const rpowFields = {
-        'wallet pubkey': rpow.walletPubHex,
-        'wallet configured': rpow.walletConfigured ? 'yes' : 'no',
-        'mode': rpow.target,
-        'active target': rpow.activeTarget || '—',
-        'mints': rpow.totalMints,
-        'hashes': rpow.hashes,
-        'speed': rpow.hashesPerSecond ? rpow.hashesPerSecond.toLocaleString() + ' h/s' : '—',
-        'last mint': rpow.lastMintAt ? new Date(rpow.lastMintAt).toLocaleString() : '—',
-        'current node': currentNode ? (currentNode.token_name || currentNode.name || 'node') : '—',
-      };
-      const rpow2 = data.rpow2;
-      const rpow2Fields = {
-        'cookie configured': rpow2.cookieConfigured ? 'yes' : 'no',
-        'running': rpow2.running ? 'yes' : 'no',
-        'mints': rpow2.totalMints,
-        'hashes': rpow2.hashes,
-        'speed': rpow2.hashesPerSecond ? rpow2.hashesPerSecond.toLocaleString() + ' h/s' : '—',
-        'balance': rpow2.me ? (rpow2.me.balance_base_units || rpow2.me.balance || '—') : '—',
-        'reward': rpow2.ledger ? rpow2.ledger.current_reward_base_units : '—',
-        'difficulty': rpow2.ledger ? rpow2.ledger.current_difficulty_bits : '—',
-      };
-      rpowStats.innerHTML = Object.entries(rpowFields).map(([k, v]) => '<div class="k">' + k + '</div><div class="v">' + (v ?? '—') + '</div>').join('');
-      rpow2Stats.innerHTML = Object.entries(rpow2Fields).map(([k, v]) => '<div class="k">' + k + '</div><div class="v">' + (v ?? '—') + '</div>').join('');
-      nodesList.innerHTML = (rpow.registry || []).length ? rpow.registry.map((node) => {
+      nodesList.innerHTML = (rpow.registry || []).length ? rpow.registry.map(function(node) {
         const info = rpow.target === 'both' ? (rpow.nodeInfo && rpow.nodeInfo[node.id]) : (rpow.nodeInfo && rpow.nodeInfo[rpow.activeTarget || rpow.target]);
         return '<div class="item"><div><b>' + node.id + '</b> <span class="small">' + node.name + '</span>' + (info ? '<div class="small">difficulty ' + info.difficulty_bits + ' · users ' + info.user_count + ' · supply ' + info.current_supply + '/' + info.max_supply + '</div>' : '') + '</div><div class="small">' + (node.baseUrl || '') + '</div></div>';
       }).join('') : '<div class="small">no nodes loaded yet</div>';
-      const lines = [];
-      lines.push('RPOW: ' + (rpow.running ? 'running' : 'stopped') + ' | target=' + rpow.target + ' | active=' + (rpow.activeTarget || '—'));
-      if (rpow.lastChallenge) lines.push('rpow challenge: ' + rpow.lastChallenge.challenge_id);
-      if (rpow.lastResult) lines.push('rpow last result: ' + JSON.stringify(rpow.lastResult));
-      lines.push('RPOW2: ' + (rpow2.running ? 'running' : 'stopped') + ' | mints=' + rpow2.totalMints);
-      if (rpow2.lastChallenge) lines.push('rpow2 challenge: ' + rpow2.lastChallenge.challenge_id);
-      if (rpow2.lastResult) lines.push('rpow2 last result: ' + JSON.stringify(rpow2.lastResult));
-      if (data.telegram && data.telegram.chatId) lines.push('telegram: linked to chat ' + data.telegram.chatId);
-      activity.textContent = lines.join('\n');
+
+      const activity = [];
+      activity.push('RPOW: ' + (rpow.running ? 'running' : 'stopped') + ' | target=' + fmt(rpow.target) + ' | active=' + fmt(rpow.activeTarget));
+      if (rpow.lastChallenge) activity.push('rpow challenge: ' + rpow.lastChallenge.challenge_id + ' @ ' + fmt(rpow.lastChallenge.nodeId || rpow.activeTarget || rpow.target));
+      if (rpow.lastResult) activity.push('rpow last result: ' + JSON.stringify(rpow.lastResult));
+      activity.push('RPOW2: ' + (rpow2.running ? 'running' : 'stopped') + ' | mints=' + fmt(rpow2.totalMints));
+      if (rpow2.lastChallenge) activity.push('rpow2 challenge: ' + rpow2.lastChallenge.challenge_id);
+      if (rpow2.lastResult) activity.push('rpow2 last result: ' + JSON.stringify(rpow2.lastResult));
+      if (data.telegram && data.telegram.chatId) activity.push('telegram: linked to chat ' + data.telegram.chatId);
+      document.getElementById('activity').textContent = activity.join('\n');
     }
+
+    async function load() {
+      try {
+        const response = await fetch('/api/status', { headers: { accept: 'application/json' } });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data && data.error ? data.error : response.statusText);
+        render(data);
+      } catch (error) {
+        document.getElementById('statePill').textContent = 'offline';
+        document.getElementById('statePill').className = 'pill warn';
+        document.getElementById('statusLine').textContent = error.message;
+      }
+    }
+
     load();
     setInterval(load, 5000);
   </script>
@@ -704,6 +866,7 @@ function dashboardHtml() {
 }
 
 function publicState() {
+  const tabs = buildTabsData();
   return {
     rpow: {
       running: state.rpow.running,
@@ -719,7 +882,7 @@ function publicState() {
       hashes: state.rpow.hashes,
       hashesPerSecond: state.rpow.hashesPerSecond,
       registry: state.rpow.registry,
-      nodeInfo: state.rpow.target === 'both' ? state.rpow.nodeInfo : state.rpow.nodeInfo,
+      nodeInfo: state.rpow.nodeInfo,
     },
     rpow2: {
       running: state.rpow2.running,
@@ -734,6 +897,7 @@ function publicState() {
       me: state.rpow2.me,
       ledger: state.rpow2.ledger,
     },
+    tabs,
     telegram: {
       chatId: state.telegram.chatId,
       botUsername: state.telegram.botUsername,
@@ -747,11 +911,12 @@ function publicState() {
 
 async function sendTelegramReport() {
   if (!telegramToken || !state.telegram.chatId) return false;
+  const tabs = buildTabsData();
   const text = [
     'rpow monitor report',
-    renderRpowSummary(),
-    renderRpow2Summary(),
-    'Telegram: linked',
+    telegramLine(tabs.rpow2),
+    telegramLine(tabs.rpowA),
+    telegramLine(tabs.rpowB),
     'Updated: ' + new Date().toISOString(),
   ].join('\n');
   await telegramFetch('sendMessage', { chat_id: state.telegram.chatId, text, disable_web_page_preview: true });
@@ -759,6 +924,7 @@ async function sendTelegramReport() {
   await saveState();
   return true;
 }
+
 
 async function bootstrap() {
   await loadConfig();
