@@ -1,28 +1,29 @@
-# rpow-bot
+# rpow monitor
 
-Auto-mining bot and dashboard for `rpow.hopeware.ltd`.
+Public monitor for two miners:
 
-## What it does
+- `rpow.hopeware.ltd`
+- `rpow2.com`
 
-- mines rPOW A (`alpha`), rPOW B (`beta`), or both
-- shows a live dashboard
-- sends webhook notifications on start, stop, challenge, mint, and error
-- uses `RPOW_PRIVATE_KEY_HEX` from Zo Secrets when present
+## Setup
 
-## Run locally
+Set these in [Settings > Advanced](/?t=settings&s=advanced):
+
+- `RPOW_PRIVATE_KEY_HEX`
+- `RPOW2_SESSION_COOKIE`
+
+Optional:
+
+- `RPOW_TARGET` (`alpha`, `beta`, or `both`)
+- `RPOW_BASE_URL`
+- `RPOW2_API_BASE`
+
+## Run
 
 ```bash
-npm install
 npm start
 ```
 
-## Environment
+## Public dashboard
 
-- `RPOW_PRIVATE_KEY_HEX` — your 32-byte private key in hex
-- `RPOW_DASHBOARD_TOKEN` — optional dashboard lock token
-- `RPOW_TARGET` — `alpha`, `beta`, or `both`
-- `RPOW_WEBHOOK_URL` — optional default webhook
-
-## Notes
-
-The `data/` folder is local runtime state and is ignored by Git.
+Open the service URL on your phone to see both miners live.

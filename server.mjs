@@ -11,13 +11,21 @@ const enc = new TextEncoder();
 const baseDir = path.resolve(process.cwd(), 'data');
 const statePath = path.join(baseDir, 'state.json');
 const configPath = path.join(baseDir, 'config.json');
-const baseUrl = process.env.RPOW_BASE_URL || 'https://rpow.hopeware.ltd';
-const defaultTarget = process.env.RPOW_TARGET || 'alpha';
 const port = Number(process.env.PORT || 8787);
+const rpowBaseUrl = process.env.RPOW_BASE_URL || 'https://rpow.hopeware.ltd';
+const rpow2ApiBase = process.env.RPOW2_API_BASE || 'https://api.rpow2.com';
+const defaultTarget = process.env.RPOW_TARGET || 'both';
 const autostart = process.env.RPOW_AUTOSTART !== 'false';
 const retryDelayMs = Number(process.env.RPOW_RETRY_DELAY_MS || 1500);
 const nodeInfoRefreshMs = Number(process.env.RPOW_NODE_INFO_REFRESH_MS || 20000);
-const envPrivateKeyHex = (process.env.RPOW_PRIVATE_KEY_HEX || '').trim();
+const rpow2RefreshMs = Number(process.env.RPOW2_REFRESH_MS || 30000);
+const telegramReportMs = Number(process.env.RPOW_TELEGRAM_REPORT_MS || 10 * 60 * 1000);
+const telegramPollMs = Number(process.env.RPOW_TELEGRAM_POLL_MS || 15000);
+const rpowPrivateKeyHex = (process.env.RPOW_PRIVATE_KEY_HEX || '').trim();
+const rpow2SessionCookie = (process.env.RPOW2_SESSION_COOKIE || '').trim();
+const telegramToken = (process.env.RPOW_TELEGRAM_BOT_TOKEN || '').trim();
+const telegramChatIdEnv = (process.env.RPOW_TELEGRAM_CHAT_ID || '').trim();
+
 const supportedTargets = ['alpha', 'beta'];
 
 function hex(bytes) {
@@ -39,18 +47,12 @@ function safeJson(text) {
 
 function json(res, status, data) {
   const body = JSON.stringify(data);
-  res.writeHead(status, {
-    'content-type': 'application/json; charset=utf-8',
-    'content-length': Buffer.byteLength(body),
-  });
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(body) });
   res.end(body);
 }
 
 function html(res, body) {
-  res.writeHead(200, {
-    'content-type': 'text/html; charset=utf-8',
-    'content-length': Buffer.byteLength(body),
-  });
+  res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'content-length': Buffer.byteLength(body) });
   res.end(body);
 }
 
@@ -70,8 +72,8 @@ function trailingZeroBits(bytes) {
 }
 
 function walletFromEnv() {
-  if (!envPrivateKeyHex) return null;
-  const priv = hexToBytes(envPrivateKeyHex);
+  if (!rpowPrivateKeyHex) return null;
+  const priv = hexToBytes(rpowPrivateKeyHex);
   if (priv.length !== 32) throw new Error('RPOW_PRIVATE_KEY_HEX must be 32 bytes hex');
   return { privHex: hex(priv), pubHex: hex(secp.schnorr.getPublicKey(priv)) };
 }
@@ -83,38 +85,66 @@ function randomWallet() {
 
 function defaultState() {
   return {
-    wallet: walletFromEnv() || randomWallet(),
-    target: defaultTarget,
-    activeTarget: null,
-    running: false,
-    totalMints: 0,
-    lastMintAt: null,
-    lastError: null,
-    lastChallenge: null,
-    lastResult: null,
-    hashes: 0,
-    hashesPerSecond: 0,
-    webhookUrl: '',
-    registry: [],
-    nodeInfo: {},
+    rpow: {
+      wallet: walletFromEnv() || randomWallet(),
+      target: defaultTarget,
+      activeTarget: null,
+      running: true,
+      totalMints: 0,
+      lastMintAt: null,
+      lastError: null,
+      lastChallenge: null,
+      lastResult: null,
+      hashes: 0,
+      hashesPerSecond: 0,
+      registry: [],
+      nodeInfo: {},
+      walletConfigured: !!rpowPrivateKeyHex,
+    },
+    rpow2: {
+      running: !!rpow2SessionCookie,
+      totalMints: 0,
+      lastMintAt: null,
+      lastError: null,
+      lastChallenge: null,
+      lastResult: null,
+      hashes: 0,
+      hashesPerSecond: 0,
+      me: null,
+      ledger: null,
+      cookieConfigured: !!rpow2SessionCookie,
+    },
+    telegram: {
+      chatId: telegramChatIdEnv || '',
+      botUsername: '',
+      lastUpdateId: 0,
+      lastReportAt: null,
+      lastDiscoveredAt: null,
+    },
   };
 }
 
 let state = defaultState();
-let config = { dashboardToken: process.env.RPOW_DASHBOARD_TOKEN || '' };
-let saveChain = Promise.resolve();
-let saveQueued = false;
-let nodes = [];
-let worker = null;
-let currentStatus = 'idle';
-let currentNote = '';
-let currentError = null;
-let stopRequested = false;
-let submitInFlight = false;
-let startTimer = null;
-let challengeTimeout = null;
-let refreshTimer = null;
+let config = { dashboardToken: '' };
+let stateWrite = Promise.resolve();
+let stateDirty = false;
+let rpowWorker = null;
+let rpow2Worker = null;
+let rpowStopRequested = false;
+let rpow2StopRequested = false;
+let rpowSubmitInFlight = false;
+let rpow2SubmitInFlight = false;
+let rpowStartTimer = null;
+let rpow2StartTimer = null;
+let rpowChallengeTimeout = null;
+let rpow2ChallengeTimeout = null;
+let telegramPollBusy = false;
+let telegramReportTimer = null;
+let telegramPollTimer = null;
+let nodeInfoTimer = null;
+let rpow2MetaTimer = null;
 let startedAt = Date.now();
+let overallError = null;
 
 async function ensureDataDir() {
   await fs.mkdir(baseDir, { recursive: true });
@@ -128,16 +158,16 @@ async function loadConfig() {
 }
 
 async function saveState() {
-  saveQueued = true;
-  saveChain = saveChain.then(async () => {
-    if (!saveQueued) return;
-    saveQueued = false;
+  stateDirty = true;
+  stateWrite = stateWrite.then(async () => {
+    if (!stateDirty) return;
+    stateDirty = false;
     await ensureDataDir();
     const tmp = `${statePath}.tmp`;
     await fs.writeFile(tmp, JSON.stringify(state, null, 2) + '\n');
     await fs.rename(tmp, statePath);
   });
-  return saveChain;
+  return stateWrite;
 }
 
 async function loadState() {
@@ -148,40 +178,23 @@ async function loadState() {
     state = {
       ...fallback,
       ...parsed,
-      wallet: { ...fallback.wallet, ...(parsed.wallet || {}) },
-      registry: Array.isArray(parsed.registry) ? parsed.registry : [],
-      nodeInfo: parsed.nodeInfo && typeof parsed.nodeInfo === 'object' ? parsed.nodeInfo : {},
-      activeTarget: typeof parsed.activeTarget === 'string' ? parsed.activeTarget : null,
+      rpow: { ...fallback.rpow, ...(parsed.rpow || {}), wallet: { ...fallback.rpow.wallet, ...(parsed.rpow?.wallet || {}) } },
+      rpow2: { ...fallback.rpow2, ...(parsed.rpow2 || {}) },
+      telegram: { ...fallback.telegram, ...(parsed.telegram || {}) },
     };
   } catch {
     state = defaultState();
     await saveState();
   }
-  if (walletFromEnv()) state.wallet = walletFromEnv();
+  if (walletFromEnv()) state.rpow.wallet = walletFromEnv();
+  state.rpow.walletConfigured = !!rpowPrivateKeyHex;
+  state.rpow2.cookieConfigured = !!rpow2SessionCookie;
 }
 
 function requireAuth(req) {
   if (!config.dashboardToken) return true;
   const auth = req.headers.authorization || '';
   return auth.startsWith('Bearer ') && auth.slice(7) === config.dashboardToken;
-}
-
-function availableTargets() {
-  return supportedTargets.filter((id) => nodes.some((node) => node.id === id));
-}
-
-function selectedTargets() {
-  if (state.target === 'both') return availableTargets();
-  return supportedTargets.includes(state.target) && nodes.some((node) => node.id === state.target) ? [state.target] : [];
-}
-
-function nextTarget() {
-  const targets = selectedTargets();
-  if (!targets.length) return null;
-  if (state.target !== 'both') return targets[0];
-  if (!state.activeTarget || !targets.includes(state.activeTarget)) return targets[0];
-  const index = targets.indexOf(state.activeTarget);
-  return targets[(index + 1) % targets.length];
 }
 
 async function authHeader(privHex, url, method, payload) {
@@ -204,12 +217,20 @@ async function authHeader(privHex, url, method, payload) {
   })).toString('base64');
 }
 
+async function fetchJson(url, options = {}) {
+  const response = await fetch(url, { ...options, headers: { accept: 'application/json', ...(options.headers || {}) } });
+  const text = await response.text();
+  const data = text ? safeJson(text) ?? { raw: text } : null;
+  if (!response.ok) throw new Error(data?.message || data?.error || `${response.status}`);
+  return data;
+}
+
 async function signedFetch(nodeId, apiPath, options = {}) {
   const method = (options.method || 'GET').toUpperCase();
   const body = typeof options.body === 'string' ? options.body : options.body ? JSON.stringify(options.body) : '';
-  const signedUrl = `${baseUrl}${apiPath}`;
-  const requestUrl = `${baseUrl}/${nodeId}${apiPath}`;
-  const headers = { authorization: await authHeader(state.wallet.privHex, signedUrl, method, body), accept: 'application/json' };
+  const signedUrl = `${rpowBaseUrl}${apiPath}`;
+  const requestUrl = `${rpowBaseUrl}/${nodeId}${apiPath}`;
+  const headers = { authorization: await authHeader(state.rpow.wallet.privHex, signedUrl, method, body), accept: 'application/json' };
   if (body) headers['content-type'] = 'application/json';
   const response = await fetch(requestUrl, { method, headers, body: body || undefined });
   const text = await response.text();
@@ -218,408 +239,577 @@ async function signedFetch(nodeId, apiPath, options = {}) {
   return data;
 }
 
-async function publicJson(url) {
-  const response = await fetch(url, { headers: { accept: 'application/json' } });
+async function telegramFetch(method, body) {
+  if (!telegramToken) throw new Error('telegram token missing');
+  const response = await fetch(`https://api.telegram.org/bot${telegramToken}/${method}`, {
+    method: body ? 'POST' : 'GET',
+    headers: body ? { 'content-type': 'application/json' } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
   const text = await response.text();
   const data = text ? safeJson(text) ?? { raw: text } : null;
-  if (!response.ok) throw new Error(data?.message || data?.error || `${response.status}`);
-  return data;
+  if (!response.ok || !data?.ok) throw new Error(data?.description || data?.error || `${response.status}`);
+  return data.result;
 }
 
-async function webhook(event, nodeId = state.activeTarget || state.target) {
-  const webhookUrl = state.webhookUrl || process.env.RPOW_WEBHOOK_URL || '';
-  if (!webhookUrl) return;
-  try {
-    await fetch(webhookUrl, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ ...event, nodeId, target: state.target, ts: new Date().toISOString() }),
-    });
-  } catch {}
+function clearRpowTimers() {
+  if (rpowStartTimer) clearTimeout(rpowStartTimer);
+  if (rpowChallengeTimeout) clearTimeout(rpowChallengeTimeout);
+  rpowStartTimer = null;
+  rpowChallengeTimeout = null;
 }
 
-async function refreshRegistry() {
+function clearRpow2Timers() {
+  if (rpow2StartTimer) clearTimeout(rpow2StartTimer);
+  if (rpow2ChallengeTimeout) clearTimeout(rpow2ChallengeTimeout);
+  rpow2StartTimer = null;
+  rpow2ChallengeTimeout = null;
+}
+
+function scheduleRpowRestart(delay = retryDelayMs) {
+  if (!state.rpow.running || rpowStopRequested) return;
+  if (rpowStartTimer) clearTimeout(rpowStartTimer);
+  rpowStartTimer = setTimeout(() => {
+    rpowStartTimer = null;
+    startRpowCycle().catch((error) => { state.rpow.lastError = `restart failed: ${error.message}`; saveState().catch(() => {}); });
+  }, delay);
+}
+
+function scheduleRpow2Restart(delay = retryDelayMs) {
+  if (!state.rpow2.running || rpow2StopRequested) return;
+  if (rpow2StartTimer) clearTimeout(rpow2StartTimer);
+  rpow2StartTimer = setTimeout(() => {
+    rpow2StartTimer = null;
+    startRpow2Cycle().catch((error) => { state.rpow2.lastError = `restart failed: ${error.message}`; saveState().catch(() => {}); });
+  }, delay);
+}
+
+function availableRpowTargets() {
+  return supportedTargets.filter((id) => state.rpow.registry.some((node) => node.id === id));
+}
+
+function selectRpowTargets() {
+  if (state.rpow.target === 'both') return availableRpowTargets();
+  return supportedTargets.includes(state.rpow.target) && state.rpow.registry.some((node) => node.id === state.rpow.target) ? [state.rpow.target] : [];
+}
+
+function nextRpowTarget() {
+  const targets = selectRpowTargets();
+  if (!targets.length) return null;
+  if (state.rpow.target !== 'both') return targets[0];
+  if (!state.rpow.activeTarget || !targets.includes(state.rpow.activeTarget)) return targets[0];
+  const index = targets.indexOf(state.rpow.activeTarget);
+  return targets[(index + 1) % targets.length];
+}
+
+async function refreshRpowRegistry() {
   try {
-    const registry = await publicJson(`${baseUrl}/amm-api/registry`);
-    nodes = Array.isArray(registry) ? registry.filter((node) => node && node.mineable !== false && supportedTargets.includes(node.id)) : [];
-    state.registry = nodes.map((node) => ({ id: node.id, name: node.name || node.id, baseUrl: node.baseUrl || `/${node.id}`, status: node.status || '' }));
-    if (state.target !== 'both' && !nodes.some((node) => node.id === state.target) && nodes[0]) state.target = nodes[0].id;
-    if (state.target === 'both' && !availableTargets().length && nodes[0]) state.target = nodes[0].id;
+    const registry = await fetchJson(`${rpowBaseUrl}/amm-api/registry`);
+    state.rpow.registry = Array.isArray(registry)
+      ? registry.filter((node) => node && node.mineable !== false && supportedTargets.includes(node.id)).map((node) => ({
+          id: node.id,
+          name: node.name || node.id,
+          baseUrl: node.baseUrl || `/${node.id}`,
+          status: node.status || '',
+        }))
+      : [];
+    if (state.rpow.target !== 'both' && !state.rpow.registry.some((node) => node.id === state.rpow.target) && state.rpow.registry[0]) {
+      state.rpow.target = state.rpow.registry[0].id;
+    }
+    if (state.rpow.target === 'both' && !availableRpowTargets().length && state.rpow.registry[0]) {
+      state.rpow.target = state.rpow.registry[0].id;
+    }
     await saveState();
   } catch (error) {
-    currentError = `registry refresh failed: ${error.message}`;
+    state.rpow.lastError = `registry refresh failed: ${error.message}`;
+    overallError = state.rpow.lastError;
   }
 }
 
-async function refreshNodeInfo() {
-  const targets = state.target === 'both' ? availableTargets() : (state.target ? [state.target] : []);
+async function refreshRpowNodeInfo() {
+  const targets = state.rpow.target === 'both' ? availableRpowTargets() : (state.rpow.target ? [state.rpow.target] : []);
   for (const target of targets) {
     try {
-      state.nodeInfo[target] = await publicJson(`${baseUrl}/${target}/node-info`);
+      state.rpow.nodeInfo[target] = await fetchJson(`${rpowBaseUrl}/${target}/node-info`);
     } catch (error) {
-      currentError = `node info failed: ${error.message}`;
+      state.rpow.lastError = `node info failed: ${error.message}`;
+      overallError = state.rpow.lastError;
     }
   }
   await saveState();
 }
 
-async function fetchChallenge(nodeId) {
-  const challenge = await signedFetch(nodeId, '/challenge', { method: 'POST' });
-  if (!challenge?.challenge_id || !challenge?.nonce_prefix) throw new Error('bad challenge response');
-  return challenge;
+async function refreshRpow2Meta() {
+  if (!state.rpow2.running) return;
+  try {
+    state.rpow2.me = await fetchJson(`${rpow2ApiBase}/me`, { headers: { cookie: `rpow_session=${rpow2SessionCookie}` } });
+    state.rpow2.ledger = await fetchJson(`${rpow2ApiBase}/ledger`, { headers: { cookie: `rpow_session=${rpow2SessionCookie}` } });
+    await saveState();
+  } catch (error) {
+    state.rpow2.lastError = `meta refresh failed: ${error.message}`;
+    overallError = state.rpow2.lastError;
+  }
 }
 
-async function submitMint(nodeId, challenge, solutionNonce, hashes) {
+async function submitRpowMint(targetId, challenge, solutionNonce, hashes) {
   const payload = JSON.stringify({ challenge_id: challenge.challenge_id, solution_nonce: String(solutionNonce) });
-  const result = await signedFetch(nodeId, '/mint', { method: 'POST', body: payload });
-  state.totalMints += 1;
-  state.lastMintAt = new Date().toISOString();
-  state.lastError = null;
-  state.lastResult = { ...result, nodeId, challenge_id: challenge.challenge_id, solution_nonce: String(solutionNonce), hashes: String(hashes) };
-  currentNote = `minted #${state.totalMints}`;
+  const result = await signedFetch(targetId, '/mint', { method: 'POST', body: payload });
+  state.rpow.totalMints += 1;
+  state.rpow.lastMintAt = new Date().toISOString();
+  state.rpow.lastError = null;
+  state.rpow.lastResult = { ...result, nodeId: targetId, challenge_id: challenge.challenge_id, solution_nonce: String(solutionNonce), hashes: String(hashes) };
   await saveState();
-  await webhook({ event: 'mint', challenge_id: challenge.challenge_id, nodeId, solution_nonce: String(solutionNonce), hashes: String(hashes), result }, nodeId);
   return result;
 }
 
-function clearTimers() {
-  if (startTimer) clearTimeout(startTimer);
-  if (challengeTimeout) clearTimeout(challengeTimeout);
-  startTimer = null;
-  challengeTimeout = null;
+async function submitRpow2Mint(challenge, solutionNonce, hashes) {
+  const response = await fetch(`${rpow2ApiBase}/mint`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', cookie: `rpow_session=${rpow2SessionCookie}`, accept: 'application/json' },
+    body: JSON.stringify({ challenge_id: challenge.challenge_id, solution_nonce: String(solutionNonce) }),
+  });
+  const text = await response.text();
+  const data = text ? safeJson(text) ?? { raw: text } : null;
+  if (!response.ok) throw new Error(data?.message || data?.error || `${response.status}`);
+  state.rpow2.totalMints += 1;
+  state.rpow2.lastMintAt = new Date().toISOString();
+  state.rpow2.lastError = null;
+  state.rpow2.lastResult = { ...data, challenge_id: challenge.challenge_id, solution_nonce: String(solutionNonce), hashes: String(hashes) };
+  await saveState();
+  return data;
 }
 
-function scheduleRestart(delay = retryDelayMs) {
-  if (!state.running || stopRequested) return;
-  if (startTimer) clearTimeout(startTimer);
-  startTimer = setTimeout(() => {
-    startTimer = null;
-    startMining().catch((error) => {
-      currentError = `restart failed: ${error.message}`;
-    });
-  }, delay);
+function updateProgress(which, msg) {
+  const hashes = Number(msg.hashes || 0);
+  const elapsedMs = Number(msg.elapsed_ms || 1);
+  const speed = Math.round((hashes / Math.max(elapsedMs, 1)) * 1000);
+  if (which === 'rpow') {
+    state.rpow.hashes = hashes;
+    state.rpow.hashesPerSecond = speed;
+  } else {
+    state.rpow2.hashes = hashes;
+    state.rpow2.hashesPerSecond = speed;
+  }
+  saveState().catch(() => {});
 }
 
-function updateProgress(msg) {
-  state.hashes = Number(msg.hashes || 0);
-  state.hashesPerSecond = msg.elapsed_ms ? Math.round((state.hashes / Math.max(msg.elapsed_ms, 1)) * 1000) : 0;
-  currentStatus = 'mining';
-}
-
-function killWorker() {
-  if (worker) worker.postMessage({ type: 'abort' });
-}
-
-async function startMining() {
-  if (!state.running || worker || submitInFlight) return;
-  if (!nodes.length) await refreshRegistry();
-  const targetId = nextTarget();
+async function startRpowCycle() {
+  if (!state.rpow.running || rpowWorker || rpowSubmitInFlight) return;
+  if (!state.rpow.registry.length) await refreshRpowRegistry();
+  const targetId = nextRpowTarget();
   if (!targetId) {
-    currentError = `target ${state.target} not available`;
-    state.running = false;
+    state.rpow.lastError = `target ${state.rpow.target} not available`;
+    overallError = state.rpow.lastError;
+    state.rpow.running = false;
     await saveState();
-    await webhook({ event: 'error', error: currentError });
     return;
   }
-
-  state.activeTarget = targetId;
-  stopRequested = false;
-  currentError = null;
-  currentStatus = 'getting-challenge';
-  currentNote = state.target === 'both' ? `cycling ${targetId}` : '';
+  rpowStopRequested = false;
+  state.rpow.activeTarget = targetId;
+  state.rpow.lastError = null;
   await saveState();
-
   try {
-    const challenge = await fetchChallenge(targetId);
-    state.lastChallenge = { ...challenge, nodeId: targetId };
+    const challenge = await signedFetch(targetId, '/challenge', { method: 'POST' });
+    state.rpow.lastChallenge = { ...challenge, nodeId: targetId };
     await saveState();
-    await webhook({ event: 'challenge', nodeId: targetId, challenge_id: challenge.challenge_id, difficulty_bits: challenge.difficulty_bits, expires_at: challenge.expires_at }, targetId);
-
-    worker = new Worker(new URL('./miner.worker.mjs', import.meta.url));
-    worker.on('message', async (msg) => {
+    rpowWorker = new Worker(new URL('./miner.worker.mjs', import.meta.url));
+    rpowWorker.on('message', async (msg) => {
       if (!msg || typeof msg !== 'object') return;
-      if (msg.type === 'progress') {
-        updateProgress(msg);
-        return;
-      }
+      if (msg.type === 'progress') return updateProgress('rpow', msg);
       if (msg.type === 'found') {
-        clearTimers();
-        if (worker) await worker.terminate().catch(() => {});
-        worker = null;
-        submitInFlight = true;
-        currentStatus = 'submitting';
+        clearRpowTimers();
+        if (rpowWorker) await rpowWorker.terminate().catch(() => {});
+        rpowWorker = null;
+        rpowSubmitInFlight = true;
         try {
-          const result = await submitMint(targetId, challenge, msg.solution_nonce, msg.hashes);
-          currentNote = `success ${targetId} ${result?.token?.value ?? ''}`.trim();
-        } catch (error) {
-          currentError = `mint failed: ${error.message}`;
-          state.lastError = currentError;
+          const result = await submitRpowMint(targetId, challenge, msg.solution_nonce, msg.hashes);
+          state.rpow.lastResult = { ...(state.rpow.lastResult || {}), token: result?.token || result?.tokenSummary || null };
+          state.rpow.lastError = null;
           await saveState();
-          await webhook({ event: 'error', error: currentError, nodeId: targetId, challenge_id: challenge.challenge_id, solution_nonce: msg.solution_nonce }, targetId);
+        } catch (error) {
+          state.rpow.lastError = `mint failed: ${error.message}`;
+          overallError = state.rpow.lastError;
+          await saveState();
         } finally {
-          submitInFlight = false;
-          if (state.running && !stopRequested) scheduleRestart();
+          rpowSubmitInFlight = false;
+          if (state.rpow.running && !rpowStopRequested) scheduleRpowRestart();
         }
         return;
       }
       if (msg.type === 'aborted') {
-        clearTimers();
-        if (worker) await worker.terminate().catch(() => {});
-        worker = null;
-        currentStatus = stopRequested ? 'idle' : 'aborted';
-        if (state.running && !stopRequested) scheduleRestart();
+        clearRpowTimers();
+        if (rpowWorker) await rpowWorker.terminate().catch(() => {});
+        rpowWorker = null;
+        if (state.rpow.running && !rpowStopRequested) scheduleRpowRestart();
       }
     });
-    worker.on('error', async (error) => {
-      currentError = `worker error: ${error.message}`;
-      state.lastError = currentError;
+    rpowWorker.on('error', async (error) => {
+      state.rpow.lastError = `worker error: ${error.message}`;
+      overallError = state.rpow.lastError;
       await saveState();
-      await webhook({ event: 'error', error: currentError, nodeId: targetId }, targetId);
-      worker = null;
-      submitInFlight = false;
-      if (state.running && !stopRequested) scheduleRestart();
+      rpowWorker = null;
+      rpowSubmitInFlight = false;
+      if (state.rpow.running && !rpowStopRequested) scheduleRpowRestart();
     });
-    worker.on('exit', () => {
-      worker = null;
-      clearTimers();
+    rpowWorker.on('exit', () => {
+      rpowWorker = null;
+      clearRpowTimers();
     });
-
     const expiresAt = new Date(challenge.expires_at).getTime();
-    challengeTimeout = setTimeout(() => killWorker(), Math.max(1000, expiresAt - Date.now() - 5000));
-    worker.postMessage({ type: 'start', nonce_prefix: challenge.nonce_prefix, difficulty_bits: challenge.difficulty_bits });
+    rpowChallengeTimeout = setTimeout(() => {
+      if (rpowWorker) rpowWorker.postMessage({ type: 'abort' });
+    }, Math.max(1000, expiresAt - Date.now() - 5000));
+    rpowWorker.postMessage({ type: 'start', nonce_prefix: challenge.nonce_prefix, difficulty_bits: challenge.difficulty_bits });
   } catch (error) {
-    currentError = `challenge failed: ${error.message}`;
-    state.lastError = currentError;
-    currentStatus = 'error';
+    state.rpow.lastError = `challenge failed: ${error.message}`;
+    overallError = state.rpow.lastError;
     await saveState();
-    await webhook({ event: 'error', error: currentError, nodeId: targetId }, targetId);
-    if (state.running && !stopRequested) scheduleRestart();
+    if (state.rpow.running && !rpowStopRequested) scheduleRpowRestart();
   }
 }
 
-async function setRunning(next) {
-  state.running = next;
-  if (next) {
-    stopRequested = false;
-    currentNote = 'starting';
-    await saveState();
-    await webhook({ event: 'start' });
-    await startMining();
-  } else {
-    stopRequested = true;
-    clearTimers();
-    if (worker) await worker.terminate().catch(() => {});
-    worker = null;
-    currentStatus = 'idle';
-    currentNote = 'stopped';
-    await saveState();
-    await webhook({ event: 'stop' });
-  }
-}
-
-async function setTarget(target) {
-  if (!target) throw new Error('missing target');
-  if (!['alpha', 'beta', 'both'].includes(target)) throw new Error('unsupported target');
-  state.target = target;
-  state.activeTarget = null;
-  state.lastError = null;
+async function startRpow2Cycle() {
+  if (!state.rpow2.running || rpow2Worker || rpow2SubmitInFlight || !rpow2SessionCookie) return;
+  rpow2StopRequested = false;
+  state.rpow2.lastError = null;
   await saveState();
-  if (state.running) {
-    stopRequested = true;
-    clearTimers();
-    if (worker) await worker.terminate().catch(() => {});
-    worker = null;
-    stopRequested = false;
-    scheduleRestart(250);
+  try {
+    const challenge = await fetchJson(`${rpow2ApiBase}/challenge`, {
+      method: 'POST',
+      headers: { cookie: `rpow_session=${rpow2SessionCookie}` },
+    });
+    state.rpow2.lastChallenge = challenge;
+    await saveState();
+    rpow2Worker = new Worker(new URL('./miner.worker.mjs', import.meta.url));
+    rpow2Worker.on('message', async (msg) => {
+      if (!msg || typeof msg !== 'object') return;
+      if (msg.type === 'progress') return updateProgress('rpow2', msg);
+      if (msg.type === 'found') {
+        clearRpow2Timers();
+        if (rpow2Worker) await rpow2Worker.terminate().catch(() => {});
+        rpow2Worker = null;
+        rpow2SubmitInFlight = true;
+        try {
+          await submitRpow2Mint(challenge, msg.solution_nonce, msg.hashes);
+          state.rpow2.lastError = null;
+          await saveState();
+        } catch (error) {
+          state.rpow2.lastError = `mint failed: ${error.message}`;
+          overallError = state.rpow2.lastError;
+          await saveState();
+        } finally {
+          rpow2SubmitInFlight = false;
+          if (state.rpow2.running && !rpow2StopRequested) scheduleRpow2Restart();
+        }
+        return;
+      }
+      if (msg.type === 'aborted') {
+        clearRpow2Timers();
+        if (rpow2Worker) await rpow2Worker.terminate().catch(() => {});
+        rpow2Worker = null;
+        if (state.rpow2.running && !rpow2StopRequested) scheduleRpow2Restart();
+      }
+    });
+    rpow2Worker.on('error', async (error) => {
+      state.rpow2.lastError = `worker error: ${error.message}`;
+      overallError = state.rpow2.lastError;
+      await saveState();
+      rpow2Worker = null;
+      rpow2SubmitInFlight = false;
+      if (state.rpow2.running && !rpow2StopRequested) scheduleRpow2Restart();
+    });
+    rpow2Worker.on('exit', () => {
+      rpow2Worker = null;
+      clearRpow2Timers();
+    });
+    const expiresAt = new Date(challenge.expires_at).getTime();
+    rpow2ChallengeTimeout = setTimeout(() => {
+      if (rpow2Worker) rpow2Worker.postMessage({ type: 'abort' });
+    }, Math.max(1000, expiresAt - Date.now() - 5000));
+    rpow2Worker.postMessage({ type: 'start', nonce_prefix: challenge.nonce_prefix, difficulty_bits: challenge.difficulty_bits });
+  } catch (error) {
+    state.rpow2.lastError = `challenge failed: ${error.message}`;
+    overallError = state.rpow2.lastError;
+    await saveState();
+    if (state.rpow2.running && !rpow2StopRequested) scheduleRpow2Restart();
   }
 }
 
-async function setWebhookUrl(url) {
-  state.webhookUrl = url || '';
+async function pollTelegramUpdates() {
+  if (!telegramToken || telegramPollBusy) return;
+  telegramPollBusy = true;
+  try {
+    if (!state.telegram.botUsername) {
+      try {
+        const me = await telegramFetch('getMe');
+        state.telegram.botUsername = me?.username || '';
+        await saveState();
+      } catch {}
+    }
+    const updates = await telegramFetch('getUpdates?timeout=10&offset=' + String((state.telegram.lastUpdateId || 0) + 1));
+    for (const upd of updates || []) {
+      if (typeof upd?.update_id === 'number') state.telegram.lastUpdateId = Math.max(state.telegram.lastUpdateId || 0, upd.update_id);
+      const chatId = upd?.message?.chat?.id ?? upd?.channel_post?.chat?.id ?? upd?.callback_query?.message?.chat?.id;
+      if (chatId != null && !state.telegram.chatId) {
+        state.telegram.chatId = String(chatId);
+        state.telegram.lastDiscoveredAt = new Date().toISOString();
+        await saveState();
+        await sendTelegramMessage('Telegram linked. You will get reports every ' + Math.round(telegramReportMs / 60000) + ' minutes.');
+      }
+    }
+  } catch (error) {
+    overallError = `telegram poll failed: ${error.message}`;
+  } finally {
+    telegramPollBusy = false;
+  }
+}
+
+async function sendTelegramMessage(text) {
+  if (!telegramToken || !state.telegram.chatId) return false;
+  await telegramFetch('sendMessage', { chat_id: state.telegram.chatId, text, disable_web_page_preview: true });
+  state.telegram.lastReportAt = new Date().toISOString();
   await saveState();
+  return true;
+}
+
+function fmtTime(iso) {
+  return iso ? new Date(iso).toLocaleString('en-US', { timeZone: 'Asia/Jakarta' }) : '—';
+}
+
+function renderRpowSummary() {
+  const currentNode = state.rpow.target === 'both' ? state.rpow.nodeInfo?.[state.rpow.activeTarget] : state.rpow.nodeInfo?.[state.rpow.activeTarget || state.rpow.target];
+  const targetLabel = state.rpow.target === 'both' ? `both (${state.rpow.activeTarget || 'waiting'})` : state.rpow.target;
+  const nodeLabel = currentNode ? `${currentNode.token_name || currentNode.name || state.rpow.activeTarget || state.rpow.target} | difficulty ${currentNode.difficulty_bits ?? '—'} | users ${currentNode.user_count ?? '—'}` : 'no node info yet';
+  return `RPOW: ${state.rpow.running ? 'running' : 'stopped'} | target=${targetLabel} | mints=${state.rpow.totalMints} | speed=${state.rpow.hashesPerSecond.toLocaleString()} h/s | ${nodeLabel}`;
+}
+
+function renderRpow2Summary() {
+  const me = state.rpow2.me;
+  const ledger = state.rpow2.ledger;
+  const reward = ledger?.current_reward_base_units || '—';
+  const diff = ledger?.current_difficulty_bits ?? '—';
+  const balance = me?.balance_base_units || me?.balance || '—';
+  return `RPOW2: ${state.rpow2.running ? 'running' : 'stopped'} | mints=${state.rpow2.totalMints} | balance=${balance} | reward=${reward} | difficulty=${diff}`;
+}
+
+function dashboardHtml() {
+  const botHint = state.telegram.botUsername ? `https://t.me/${state.telegram.botUsername}` : 'waiting for bot username';
+  const telegramHint = state.telegram.chatId ? 'linked' : (telegramToken ? 'send /start to the bot once to link Telegram' : 'telegram token not configured');
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>rpow monitor</title>
+  <style>
+    :root{color-scheme:dark;--bg:#09090b;--card:#111827;--border:#243044;--text:#e5e7eb;--muted:#94a3b8;--accent:#34d399;--warn:#f59e0b;--err:#f87171}
+    *{box-sizing:border-box} body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;background:radial-gradient(circle at top,#0f172a,#09090b 60%);color:var(--text)}
+    .wrap{max-width:1100px;margin:0 auto;padding:20px} h1{margin:0 0 6px;font-size:28px} .sub{color:var(--muted);margin-bottom:16px;line-height:1.45}
+    .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px} .card{grid-column:span 6;background:rgba(17,24,39,.92);border:1px solid var(--border);border-radius:16px;padding:16px;box-shadow:0 16px 50px rgba(0,0,0,.24)} .card.full{grid-column:1/-1}
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:space-between} .kv{display:grid;grid-template-columns:180px 1fr;gap:8px 12px;font-size:14px}
+    .k{color:var(--muted)} .v{word-break:break-all} .pill{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);border-radius:999px;padding:6px 10px;font-size:12px;color:var(--muted);background:rgba(15,23,42,.7)}
+    .ok{color:var(--accent)} .warn{color:var(--warn)} .bad{color:var(--err)} .small{font-size:12px;color:var(--muted)} .statusline{font-size:14px;line-height:1.6} pre{margin:0;white-space:pre-wrap;word-break:break-word}
+    .list{display:grid;gap:8px} .item{display:flex;justify-content:space-between;gap:10px;padding:10px 12px;border:1px solid var(--border);border-radius:12px;background:rgba(15,23,42,.45)}
+    @media (max-width:900px){.card{grid-column:1/-1}.kv{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>rpow monitor</h1>
+    <div class="sub">Public status page for both miners. This page is read-only and safe to open on your phone while your laptop is off.</div>
+    <div class="grid">
+      <div class="card full">
+        <div class="row">
+          <div>
+            <div class="pill ${state.rpow.running || state.rpow2.running ? 'ok' : 'warn'}" id="statePill">${state.rpow.running || state.rpow2.running ? 'running' : 'idle'}</div>
+            <div class="statusline" id="statusLine" style="margin-top:10px">${overallError ? `<span class="bad">${overallError}</span>` : 'all good'}</div>
+          </div>
+          <div class="small">${telegramHint}<br/>${botHint}</div>
+        </div>
+      </div>
+      <div class="card"><div class="kv" id="rpowStats"></div></div>
+      <div class="card"><div class="kv" id="rpow2Stats"></div></div>
+      <div class="card full">
+        <div class="row" style="margin-bottom:10px"><strong>Known RPOW nodes</strong><span class="small">auto-refreshed</span></div>
+        <div class="list" id="nodesList"></div>
+      </div>
+      <div class="card full">
+        <div class="row" style="margin-bottom:10px"><strong>Recent activity</strong><span class="small">local state only</span></div>
+        <pre id="activity" class="small">waiting…</pre>
+      </div>
+      <div class="card full">
+        <div class="row" style="margin-bottom:10px"><strong>Telegram</strong><span class="small">reports every ${Math.round(telegramReportMs / 60000)} min</span></div>
+        <div class="small">${telegramHint}</div>
+      </div>
+    </div>
+  </div>
+  <script>
+    async function load() {
+      const response = await fetch('/api/status', { headers: { accept: 'application/json' } });
+      const data = await response.json();
+      const statePill = document.getElementById('statePill');
+      const statusLine = document.getElementById('statusLine');
+      const rpowStats = document.getElementById('rpowStats');
+      const rpow2Stats = document.getElementById('rpow2Stats');
+      const nodesList = document.getElementById('nodesList');
+      const activity = document.getElementById('activity');
+      statePill.textContent = (data.rpow.running || data.rpow2.running ? 'running' : 'idle');
+      statePill.className = 'pill ' + (data.rpow.running || data.rpow2.running ? 'ok' : 'warn');
+      statusLine.innerHTML = data.overallError ? '<span class="bad">' + data.overallError + '</span>' : 'all good';
+      const rpow = data.rpow;
+      const currentNode = rpow.target === 'both' ? (rpow.nodeInfo && rpow.nodeInfo[rpow.activeTarget]) : (rpow.nodeInfo && rpow.nodeInfo[rpow.activeTarget || rpow.target]);
+      const rpowFields = {
+        'wallet pubkey': rpow.walletPubHex,
+        'wallet configured': rpow.walletConfigured ? 'yes' : 'no',
+        'mode': rpow.target,
+        'active target': rpow.activeTarget || '—',
+        'mints': rpow.totalMints,
+        'hashes': rpow.hashes,
+        'speed': rpow.hashesPerSecond ? rpow.hashesPerSecond.toLocaleString() + ' h/s' : '—',
+        'last mint': rpow.lastMintAt ? new Date(rpow.lastMintAt).toLocaleString() : '—',
+        'current node': currentNode ? (currentNode.token_name || currentNode.name || 'node') : '—',
+      };
+      const rpow2 = data.rpow2;
+      const rpow2Fields = {
+        'cookie configured': rpow2.cookieConfigured ? 'yes' : 'no',
+        'running': rpow2.running ? 'yes' : 'no',
+        'mints': rpow2.totalMints,
+        'hashes': rpow2.hashes,
+        'speed': rpow2.hashesPerSecond ? rpow2.hashesPerSecond.toLocaleString() + ' h/s' : '—',
+        'balance': rpow2.me ? (rpow2.me.balance_base_units || rpow2.me.balance || '—') : '—',
+        'reward': rpow2.ledger ? rpow2.ledger.current_reward_base_units : '—',
+        'difficulty': rpow2.ledger ? rpow2.ledger.current_difficulty_bits : '—',
+      };
+      rpowStats.innerHTML = Object.entries(rpowFields).map(([k, v]) => '<div class="k">' + k + '</div><div class="v">' + (v ?? '—') + '</div>').join('');
+      rpow2Stats.innerHTML = Object.entries(rpow2Fields).map(([k, v]) => '<div class="k">' + k + '</div><div class="v">' + (v ?? '—') + '</div>').join('');
+      nodesList.innerHTML = (rpow.registry || []).length ? rpow.registry.map((node) => {
+        const info = rpow.target === 'both' ? (rpow.nodeInfo && rpow.nodeInfo[node.id]) : (rpow.nodeInfo && rpow.nodeInfo[rpow.activeTarget || rpow.target]);
+        return '<div class="item"><div><b>' + node.id + '</b> <span class="small">' + node.name + '</span>' + (info ? '<div class="small">difficulty ' + info.difficulty_bits + ' · users ' + info.user_count + ' · supply ' + info.current_supply + '/' + info.max_supply + '</div>' : '') + '</div><div class="small">' + (node.baseUrl || '') + '</div></div>';
+      }).join('') : '<div class="small">no nodes loaded yet</div>';
+      const lines = [];
+      lines.push('RPOW: ' + (rpow.running ? 'running' : 'stopped') + ' | target=' + rpow.target + ' | active=' + (rpow.activeTarget || '—'));
+      if (rpow.lastChallenge) lines.push('rpow challenge: ' + rpow.lastChallenge.challenge_id);
+      if (rpow.lastResult) lines.push('rpow last result: ' + JSON.stringify(rpow.lastResult));
+      lines.push('RPOW2: ' + (rpow2.running ? 'running' : 'stopped') + ' | mints=' + rpow2.totalMints);
+      if (rpow2.lastChallenge) lines.push('rpow2 challenge: ' + rpow2.lastChallenge.challenge_id);
+      if (rpow2.lastResult) lines.push('rpow2 last result: ' + JSON.stringify(rpow2.lastResult));
+      if (data.telegram && data.telegram.chatId) lines.push('telegram: linked to chat ' + data.telegram.chatId);
+      activity.textContent = lines.join('\n');
+    }
+    load();
+    setInterval(load, 5000);
+  </script>
+</body>
+</html>`;
 }
 
 function publicState() {
   return {
-    running: state.running,
-    status: currentStatus,
-    target: state.target,
-    activeTarget: state.activeTarget,
-    walletPubHex: state.wallet.pubHex,
-    totalMints: state.totalMints,
-    lastMintAt: state.lastMintAt,
-    lastError: state.lastError || currentError,
-    lastResult: state.lastResult,
-    lastChallenge: state.lastChallenge,
-    hashes: state.hashes,
-    hashesPerSecond: state.hashesPerSecond,
-    note: currentNote,
-    webhookUrl: state.webhookUrl ? 'set' : '',
-    registry: state.registry,
-    nodeInfo: state.target === 'both' ? state.nodeInfo : state.nodeInfo[state.target] || null,
+    rpow: {
+      running: state.rpow.running,
+      target: state.rpow.target,
+      activeTarget: state.rpow.activeTarget,
+      walletPubHex: state.rpow.wallet.pubHex,
+      walletConfigured: state.rpow.walletConfigured,
+      totalMints: state.rpow.totalMints,
+      lastMintAt: state.rpow.lastMintAt,
+      lastError: state.rpow.lastError,
+      lastResult: state.rpow.lastResult,
+      lastChallenge: state.rpow.lastChallenge,
+      hashes: state.rpow.hashes,
+      hashesPerSecond: state.rpow.hashesPerSecond,
+      registry: state.rpow.registry,
+      nodeInfo: state.rpow.target === 'both' ? state.rpow.nodeInfo : state.rpow.nodeInfo,
+    },
+    rpow2: {
+      running: state.rpow2.running,
+      cookieConfigured: state.rpow2.cookieConfigured,
+      totalMints: state.rpow2.totalMints,
+      lastMintAt: state.rpow2.lastMintAt,
+      lastError: state.rpow2.lastError,
+      lastResult: state.rpow2.lastResult,
+      lastChallenge: state.rpow2.lastChallenge,
+      hashes: state.rpow2.hashes,
+      hashesPerSecond: state.rpow2.hashesPerSecond,
+      me: state.rpow2.me,
+      ledger: state.rpow2.ledger,
+    },
+    telegram: {
+      chatId: state.telegram.chatId,
+      botUsername: state.telegram.botUsername,
+      lastReportAt: state.telegram.lastReportAt,
+      lastDiscoveredAt: state.telegram.lastDiscoveredAt,
+    },
+    overallError,
     uptimeMs: Date.now() - startedAt,
   };
 }
 
-function dashboardHtml() {
-  return [
-    '<!doctype html>',
-    '<html lang="en">',
-    '<head>',
-    '<meta charset="utf-8" />',
-    '<meta name="viewport" content="width=device-width, initial-scale=1" />',
-    '<title>rpow bot</title>',
-    '<style>',
-    '  :root{color-scheme:dark;--bg:#09090b;--panel:#111827;--border:#243044;--text:#e5e7eb;--muted:#94a3b8;--accent:#34d399;--warn:#f59e0b;--err:#f87171}',
-    '  *{box-sizing:border-box} body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;background:radial-gradient(circle at top,#0f172a,#09090b 60%);color:var(--text)}',
-    '  .wrap{max-width:1100px;margin:0 auto;padding:24px} h1{margin:0 0 6px;font-size:28px} .sub{color:var(--muted);margin-bottom:18px}',
-    '  .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px} .card{grid-column:span 6;background:rgba(17,24,39,.9);border:1px solid var(--border);border-radius:16px;padding:16px;box-shadow:0 16px 50px rgba(0,0,0,.24)}',
-    '  .card.full{grid-column:1/-1} .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.kv{display:grid;grid-template-columns:180px 1fr;gap:8px 12px;font-size:14px}.k{color:var(--muted)} .v{word-break:break-all}',
-    '  .pill{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);border-radius:999px;padding:6px 10px;font-size:12px;color:var(--muted);background:rgba(15,23,42,.7)}',
-    '  .ok{color:var(--accent)} .bad{color:var(--err)} .warn{color:var(--warn)} button,input,select{border-radius:12px;border:1px solid var(--border);background:#0f172a;color:var(--text);padding:10px 12px;font:inherit}',
-    '  button{cursor:pointer} button.primary{background:linear-gradient(135deg,#10b981,#06b6d4);border:none;color:#04111b;font-weight:700} button.ghost{background:transparent} .muted{color:var(--muted)}',
-    '  input,select{width:100%} .actions{display:flex;gap:10px;flex-wrap:wrap} .actions button{min-width:110px} .login{display:grid;gap:10px;max-width:420px} .hidden{display:none!important}',
-    '  .list{display:grid;gap:8px} .item{display:flex;justify-content:space-between;gap:10px;padding:10px 12px;border:1px solid var(--border);border-radius:12px;background:rgba(15,23,42,.45)}',
-    '  .small{font-size:12px;color:var(--muted)} .statusline{font-size:14px;line-height:1.6} pre{margin:0;white-space:pre-wrap;word-break:break-word}',
-    '  @media (max-width:900px){.card{grid-column:1/-1}.kv{grid-template-columns:1fr}}',
-    '</style>',
-    '</head>',
-    '<body>',
-    '  <div class="wrap">',
-    '    <h1>rpow bot</h1>',
-    '    <div class="sub">Auto-mining for rpow.hopeware.ltd with dashboard, webhook notifications, and both-node cycling.</div>',
-    '    <div class="grid">',
-    '      <div class="card full">',
-    '        <div class="row" style="justify-content:space-between;align-items:flex-start">',
-    '          <div>',
-    '            <div class="pill" id="statePill">loading…</div>',
-    '            <div class="statusline" id="statusLine" style="margin-top:10px">connecting…</div>',
-    '          </div>',
-    '          <div class="actions">',
-    '            <button class="primary" id="startBtn">Start</button>',
-    '            <button class="ghost" id="stopBtn">Stop</button>',
-    '            <button class="ghost" id="refreshBtn">Refresh</button>',
-    '          </div>',
-    '        </div>',
-    '      </div>',
-    '      <div class="card"><div class="kv" id="stats"></div></div>',
-    '      <div class="card">',
-    '        <div class="login" id="loginBox">',
-    '          <div class="muted">Dashboard token</div>',
-    '          <input id="tokenInput" placeholder="paste token" autocomplete="off" />',
-    '          <div class="actions">',
-    '            <button class="primary" id="saveTokenBtn">Unlock</button>',
-    '            <button class="ghost" id="forgetTokenBtn">Forget</button>',
-    '          </div>',
-    '          <div class="small">Saved locally in this browser. The API also requires this token.</div>',
-    '        </div>',
-    '        <div id="controls" class="hidden">',
-    '          <div class="row">',
-    '            <div style="flex:1;min-width:180px"><div class="muted" style="margin-bottom:6px">Target</div><select id="targetSelect"></select></div>',
-    '            <div style="flex:2;min-width:260px"><div class="muted" style="margin-bottom:6px">Webhook URL</div><input id="webhookInput" placeholder="https://example.com/webhook" /></div>',
-    '          </div>',
-    '          <div class="actions" style="margin-top:12px"><button class="primary" id="saveWebhookBtn">Save webhook</button><button class="ghost" id="toggleBtn">Toggle running</button></div>',
-    '        </div>',
-    '      </div>',
-    '      <div class="card full"><div class="row" style="justify-content:space-between"><strong>Known nodes</strong><span class="small">auto-refreshed</span></div><div class="list" id="nodesList" style="margin-top:10px"></div></div>',
-    '      <div class="card full"><div class="row" style="justify-content:space-between"><strong>Recent activity</strong><span class="small">local state only</span></div><pre id="activity" style="margin-top:10px" class="small">waiting…</pre></div>',
-    '    </div>',
-    '  </div>',
-    '  <script>',
-    '    const els = { statePill: document.getElementById("statePill"), statusLine: document.getElementById("statusLine"), stats: document.getElementById("stats"), nodesList: document.getElementById("nodesList"), activity: document.getElementById("activity"), loginBox: document.getElementById("loginBox"), controls: document.getElementById("controls"), tokenInput: document.getElementById("tokenInput"), targetSelect: document.getElementById("targetSelect"), webhookInput: document.getElementById("webhookInput") };',
-    '    const savedToken = localStorage.getItem("rpow-bot-token") || "";',
-    '    if (savedToken) els.tokenInput.value = savedToken;',
-    '    function headers(extra = {}) { const token = localStorage.getItem("rpow-bot-token") || ""; const h = { accept: "application/json", ...extra }; if (token) h.authorization = "Bearer " + token; return h; }',
-    '    async function api(path, options = {}) { const response = await fetch(path, { ...options, headers: headers(options.headers || {}) }); const text = await response.text(); const data = text ? JSON.parse(text) : null; if (!response.ok) throw new Error(data?.message || data?.error || response.statusText); return data; }',
-    '    function render(data) {',
-    '      const locked = !localStorage.getItem("rpow-bot-token");',
-    '      els.loginBox.classList.toggle("hidden", !locked);',
-    '      els.controls.classList.toggle("hidden", locked);',
-    '      const targetLabel = data.target === "both" ? "both" : (data.target || "no target");',
-    '      const activeLabel = data.activeTarget ? " · active " + data.activeTarget : "";',
-    '      els.statePill.textContent = (data.running ? "running" : "idle") + " · " + targetLabel + activeLabel;',
-    '      els.statePill.className = "pill " + (data.running ? "ok" : "warn");',
-    '      els.statusLine.innerHTML = ["status: <b>" + (data.status || "—") + "</b>", data.note ? "note: " + data.note : "", data.lastError ? "<span class=\"bad\">error: " + data.lastError + "</span>" : ""].filter(Boolean).join(" · ");',
-    '      const stats = { "wallet pubkey": data.walletPubHex, "mode": data.target, "active target": data.activeTarget || "—", "mints": data.totalMints, "hashes": data.hashes, "speed": data.hashesPerSecond ? data.hashesPerSecond.toLocaleString() + " h/s" : "—", "last mint": data.lastMintAt || "—", "webhook": data.webhookUrl || "—", "uptime": Math.floor((data.uptimeMs || 0) / 1000) + "s" };',
-    '      els.stats.innerHTML = Object.entries(stats).map(([k, v]) => "<div class=\"k\">" + k + "</div><div class=\"v\">" + (v ?? "—") + "</div>").join("");',
-    '      const options = [{ id: "both", name: "rPOW A + B" }].concat((data.registry || []));',
-    '      els.targetSelect.innerHTML = options.map((node) => "<option value=\"" + node.id + "\" " + (node.id === data.target ? "selected" : "") + ">" + node.id + " — " + node.name + "</option>").join("");',
-    '      els.webhookInput.value = data.webhookUrl || "";',
-    '      els.nodesList.innerHTML = (data.registry || []).length ? data.registry.map((node) => {',
-    '        const info = data.target === "both" ? (data.nodeInfo && data.nodeInfo[node.id]) : (data.target === node.id ? data.nodeInfo : null);',
-    '        return "<div class=\"item\"><div><b>" + node.id + "</b> <span class=\"small\">" + node.name + "</span>" + (info ? "<div class=\"small\">difficulty " + info.difficulty_bits + " · users " + info.user_count + " · supply " + info.current_supply + "/" + info.max_supply + "</div>" : "") + "</div><div class=\"small\">" + (node.baseUrl || "") + "</div></div>";',
-    '      }).join("") : "<div class=\"small\">no nodes loaded yet</div>";',
-    '      const lines = [];',
-    '      lines.push("running: " + data.running);',
-    '      if (data.lastChallenge) lines.push("last challenge: " + data.lastChallenge.challenge_id + " @ " + (data.lastChallenge.nodeId || data.activeTarget || data.target));',
-    '      if (data.lastResult) lines.push("last result: " + JSON.stringify(data.lastResult));',
-    '      if (data.lastError) lines.push("last error: " + data.lastError);',
-    '      els.activity.textContent = lines.join("\n");',
-    '    }',
-    '    async function load() { try { render(await api("/api/status")); } catch (error) { els.statePill.textContent = "locked"; els.statePill.className = "pill warn"; els.statusLine.textContent = error.message; } }',
-    '    document.getElementById("saveTokenBtn").onclick = async () => { const token = els.tokenInput.value.trim(); if (!token) return; localStorage.setItem("rpow-bot-token", token); await load(); };',
-    '    document.getElementById("forgetTokenBtn").onclick = async () => { localStorage.removeItem("rpow-bot-token"); await load(); };',
-    '    document.getElementById("refreshBtn").onclick = load;',
-    '    document.getElementById("startBtn").onclick = async () => { await api("/api/control", { method: "POST", body: JSON.stringify({ action: "start" }) }); await load(); };',
-    '    document.getElementById("stopBtn").onclick = async () => { await api("/api/control", { method: "POST", body: JSON.stringify({ action: "stop" }) }); await load(); };',
-    '    document.getElementById("toggleBtn").onclick = async () => { await api("/api/control", { method: "POST", body: JSON.stringify({ action: "toggle" }) }); await load(); };',
-    '    document.getElementById("saveWebhookBtn").onclick = async () => { await api("/api/control", { method: "POST", body: JSON.stringify({ action: "set-webhook", webhookUrl: els.webhookInput.value.trim() }) }); await load(); };',
-    '    els.targetSelect.onchange = async () => { await api("/api/control", { method: "POST", body: JSON.stringify({ action: "target", target: els.targetSelect.value }) }); await load(); };',
-    '    load(); setInterval(load, 5000);',
-    '  </script>',
-    '</body>',
-    '</html>',
+async function sendTelegramReport() {
+  if (!telegramToken || !state.telegram.chatId) return false;
+  const text = [
+    'rpow monitor report',
+    renderRpowSummary(),
+    renderRpow2Summary(),
+    'Telegram: linked',
+    'Updated: ' + new Date().toISOString(),
   ].join('\n');
+  await telegramFetch('sendMessage', { chat_id: state.telegram.chatId, text, disable_web_page_preview: true });
+  state.telegram.lastReportAt = new Date().toISOString();
+  await saveState();
+  return true;
+}
+
+async function bootstrap() {
+  await loadConfig();
+  await loadState();
+  if (autostart && state.rpow.running) setTimeout(() => startRpowCycle().catch(() => {}), 800);
+  if (autostart && state.rpow2.running) setTimeout(() => startRpow2Cycle().catch(() => {}), 1200);
+  if (telegramToken) {
+    setTimeout(() => pollTelegramUpdates().catch(() => {}), 2500);
+    telegramPollTimer = setInterval(() => pollTelegramUpdates().catch(() => {}), telegramPollMs);
+    telegramReportTimer = setInterval(() => sendTelegramReport().catch(() => {}), telegramReportMs);
+  }
+  nodeInfoTimer = setInterval(() => {
+    refreshRpowRegistry().catch(() => {});
+    refreshRpowNodeInfo().catch(() => {});
+  }, nodeInfoRefreshMs);
+  rpow2MetaTimer = setInterval(() => refreshRpow2Meta().catch(() => {}), rpow2RefreshMs);
+  await refreshRpowRegistry();
+  await refreshRpowNodeInfo();
+  await refreshRpow2Meta();
+}
+
+async function readBody(req) {
+  return await new Promise((resolve) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+  });
 }
 
 async function handleRequest(req, res) {
   const url = new URL(req.url || '/', 'http://127.0.0.1');
   try {
     if (req.method === 'GET' && url.pathname === '/') return html(res, dashboardHtml());
-    if (req.method === 'GET' && url.pathname === '/api/status') {
-      if (!requireAuth(req)) return json(res, 401, { error: 'unauthorized' });
-      return json(res, 200, publicState());
-    }
-    if (req.method === 'POST' && url.pathname === '/api/control') {
-      if (!requireAuth(req)) return json(res, 401, { error: 'unauthorized' });
-      const body = safeJson(await new Promise((resolve) => {
-        const chunks = [];
-        req.on('data', (chunk) => chunks.push(chunk));
-        req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-      })) || {};
-      const action = String(body.action || '').toLowerCase();
-      if (action === 'start') await setRunning(true);
-      else if (action === 'stop') await setRunning(false);
-      else if (action === 'toggle') await setRunning(!state.running);
-      else if (action === 'set-webhook') await setWebhookUrl(String(body.webhookUrl || '').trim());
-      else if (action === 'target') await setTarget(String(body.target || '').trim());
-      else throw new Error('unknown action');
-      return json(res, 200, publicState());
-    }
-    if (req.method === 'GET' && url.pathname === '/api/export') {
-      if (!requireAuth(req)) return json(res, 401, { error: 'unauthorized' });
-      return json(res, 200, { walletPubHex: state.wallet.pubHex, target: state.target, activeTarget: state.activeTarget });
-    }
+    if (req.method === 'GET' && url.pathname === '/api/status') return json(res, 200, publicState());
     return json(res, 404, { error: 'not found' });
   } catch (error) {
     return json(res, 500, { error: error.message });
   }
 }
 
-async function bootstrap() {
-  await loadConfig();
-  await loadState();
-  await refreshRegistry();
-  await refreshNodeInfo();
-  refreshTimer = setInterval(() => {
-    refreshRegistry().catch(() => {});
-    refreshNodeInfo().catch(() => {});
-  }, nodeInfoRefreshMs);
-  if (autostart) {
-    state.running = true;
-    await saveState();
-    setTimeout(() => startMining().catch(() => {}), 800);
-  }
+async function shutdown() {
+  rpowStopRequested = true;
+  rpow2StopRequested = true;
+  clearRpowTimers();
+  clearRpow2Timers();
+  if (rpowWorker) await rpowWorker.terminate().catch(() => {});
+  if (rpow2Worker) await rpow2Worker.terminate().catch(() => {});
+  if (nodeInfoTimer) clearInterval(nodeInfoTimer);
+  if (rpow2MetaTimer) clearInterval(rpow2MetaTimer);
+  if (telegramPollTimer) clearInterval(telegramPollTimer);
+  if (telegramReportTimer) clearInterval(telegramReportTimer);
 }
 
 if (process.argv[1] && process.argv[1].endsWith('server.mjs')) {
@@ -627,15 +817,7 @@ if (process.argv[1] && process.argv[1].endsWith('server.mjs')) {
   const server = http.createServer((req, res) => {
     handleRequest(req, res).catch((error) => json(res, 500, { error: error.message }));
   });
-  server.listen(port, '0.0.0.0', () => console.log(`rpow bot listening on ${port}`));
-
-  const shutdown = async () => {
-    stopRequested = true;
-    clearTimers();
-    if (worker) await worker.terminate().catch(() => {});
-    if (refreshTimer) clearInterval(refreshTimer);
-    server.close(() => process.exit(0));
-  };
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  server.listen(port, '0.0.0.0', () => console.log(`rpow monitor listening on ${port}`));
+  process.on('SIGINT', async () => { await shutdown(); server.close(() => process.exit(0)); });
+  process.on('SIGTERM', async () => { await shutdown(); server.close(() => process.exit(0)); });
 }
